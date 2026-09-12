@@ -1,0 +1,4 @@
+
+tensorflow==2.17.0
+keras==3.5.0
+protobuf==4.25.3

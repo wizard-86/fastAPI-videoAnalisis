@@ -1,0 +1,94 @@
+┌─────────────────────────────────────────────────────────────┐
+│                     USER (Client)                           │
+│              Upload video via POST /predict                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [1] VALIDASI FILE                                          │
+│  • Cek ekstensi (.mp4, .avi, .mov, .mkv, .webm)             │
+│  • Cek ukuran (max, misal 50 MB)                            │
+│  • Cek MIME type                                            │
+│  → Kalau gagal, return 400 Bad Request                      │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [2] SIMPAN FILE SEMENTARA                                  │
+│  • Simpan ke folder /tmp atau app/static/uploads/           │
+│  • Nama unik (UUID) biar tidak bentrok antar request        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [3] LOAD & SAMPLING VIDEO (video_loader.py)                │
+│  • Buka video pakai OpenCV                                  │
+│  • Baca total frame                                         │
+│  • Sampling UNIFORM 32 frame (linspace)                     │
+│  • Resize tiap frame ke 160×160                             │
+│  • Convert BGR → RGB                                        │
+│  • Return array shape (32, 160, 160, 3)                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [4] PREPROCESSING (inference.py)                           │
+│  • Normalisasi pakai preprocess_input (EfficientNetV2)      │
+│  • Add batch dimension → (1, 32, 160, 160, 3)               │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [5] PREDIKSI MODEL (inference.py)                          │
+│  • Load model .keras (singleton, sekali saja)               │
+│  • Jalankan forward pass                                    │
+│  • Output:                                                  │
+│    ├── confidence score (0.0 – 1.0)                         │
+│    └── attention weights (32 nilai, sum = 1.0)              │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [6] INTERPRETASI HASIL                                     │
+│  • confidence > 0.5 → "Shoplifting"                         │
+│  • confidence ≤ 0.5 → "Normal"                              │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [7] VISUALISASI (grapher.py)                               │
+│  • Buat bar chart 32 frame vs attention weight              │
+│  • Simpan sebagai PNG di memory (BytesIO)                   │
+│  • Encode base64 → string siap kirim di JSON                │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [8] EKSTRAK TOP-3 FRAME (frame_extractor.py)               │
+│  • Sort attention weights descending                        │
+│  • Ambil 3 frame dengan bobot tertinggi                    │
+│  • Convert tiap frame → PNG → base64                        │
+│  • Sertakan index frame & bobotnya                          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [9] BERSIHKAN FILE SEMENTARA                               │
+│  • Hapus video dari /tmp                                    │
+│  • (Opsional) Simpan log request                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  [10] RESPONSE JSON                                         │
+│  {                                                          │
+│    "prediction": "Shoplifting",                             │
+│    "confidence": 0.87,                                      │
+│    "attention_plot": "data:image/png;base64,iVBOR...",      │
+│    "top_frames": [                                          │
+│      {"rank": 1, "frame_index": 12, "weight": 0.15, ...},   │
+│      {"rank": 2, "frame_index": 5,  "weight": 0.12, ...},   │
+│      {"rank": 3, "frame_index": 28, "weight": 0.10, ...}    │
+│    ]                                                        │
+│  }                                                          │
+└─────────────────────────────────────────────────────────────┘
