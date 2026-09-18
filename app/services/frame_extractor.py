@@ -1,12 +1,9 @@
 """
 Service untuk ekstrak top-K frame dari video.
 
-Alur:
-1. Terima video_path + top_indices (dari inference)
-2. Ambil frame di index tersebut (re-open video)
-3. Annotate setiap frame dengan rank, index, weight
-4. Convert ke base64 PNG
-5. Return list of dict (siap masuk response JSON)
+PENTING:
+- timestamp dihitung dari `sampled_indices` (index frame asli / fps)
+- ini akurat, bukan perkiraan
 """
 
 from pathlib import Path
@@ -31,6 +28,8 @@ def extract_top_frames(
     video_path: str | Path,
     top_indices: List[int],
     top_weights: List[float],
+    sampled_indices: np.ndarray,
+    fps: float,
     total_frames: int = 32,
     img_size: int | None = None,
 ) -> List[dict]:
@@ -39,8 +38,10 @@ def extract_top_frames(
 
     Args:
         video_path: path ke file video
-        top_indices: list index frame (di 32 sampling), sorted descending by weight
+        top_indices: list index frame (di 32 sampling), sorted desc by weight
         top_weights: list bobot attention untuk masing-masing index
+        sampled_indices: index frame asli yang dipilih saat sampling
+        fps: FPS video (untuk hitung timestamp)
         total_frames: jumlah total frame sampling (32)
         img_size: ukuran resize (default dari settings.IMG_SIZE)
 
@@ -51,6 +52,7 @@ def extract_top_frames(
                 "rank": 1,
                 "frame_index": 12,
                 "weight": 0.1521,
+                "timestamp_sec": 3.75,
                 "image": "data:image/png;base64,..."
             },
             ...
@@ -98,6 +100,13 @@ def extract_top_frames(
         start=1,
     ):
         try:
+            # Hitung timestamp akurat dari sampled_indices
+            timestamp_sec = _get_timestamp(
+                idx=idx,
+                sampled_indices=sampled_indices,
+                fps=fps,
+            )
+
             # Annotate + convert ke base64
             image_b64 = frame_to_base64_annotated(
                 frame=frame,
@@ -110,11 +119,13 @@ def extract_top_frames(
                 "rank": rank,
                 "frame_index": int(idx),
                 "weight": round(float(weight), 6),
+                "timestamp_sec": timestamp_sec,
                 "image": image_b64,
             })
 
             logger.debug(
                 f"Frame rank #{rank}: index={idx}, weight={weight:.4f}, "
+                f"timestamp={timestamp_sec:.2f}s, "
                 f"base64_len={len(image_b64)}"
             )
 
@@ -128,72 +139,30 @@ def extract_top_frames(
 
 
 # ============================================
-# HELPER: KONVERSI INDEX -> TIMESTAMP
+# HELPER: TIMESTAMP AKURAT
 # ============================================
-def indices_to_timestamps(
-    indices: List[int],
-    total_frames: int,
-    video_duration_sec: float,
-) -> List[float]:
+def _get_timestamp(
+    idx: int,
+    sampled_indices: np.ndarray,
+    fps: float,
+) -> float:
     """
-    Konversi index sampling (0-31) ke timestamp (detik) di video asli.
-
-    Args:
-        indices: list index di 32 sampling
-        total_frames: jumlah sampling (32)
-        video_duration_sec: durasi video (detik)
-
-    Returns:
-        list timestamp dalam detik
+    Hitung timestamp (detik) dari index sampling.
 
     Contoh:
-        indices=[12, 27], total_frames=32, duration=10.0
-        -> [3.75, 8.44]
+        idx = 12
+        sampled_indices = [0, 10, 20, ..., 319]
+        fps = 30
+
+        -> sampled_indices[12] = 120  (frame asli ke-120)
+        -> 120 / 30 = 4.0 detik
     """
-    if total_frames <= 1:
-        return [0.0] * len(indices)
+    if fps <= 0:
+        return 0.0
 
-    timestamps = []
-    for idx in indices:
-        # Posisi relatif (0.0 - 1.0)
-        position = idx / (total_frames - 1)
-        # Konversi ke detik
-        timestamp = position * video_duration_sec
-        timestamps.append(round(timestamp, 2))
+    if idx < 0 or idx >= len(sampled_indices):
+        logger.warning(f"Index {idx} di luar range sampled_indices")
+        return 0.0
 
-    return timestamps
-
-
-# ============================================
-# EXTRACT + ENRICH DENGAN TIMESTAMP
-# ============================================
-def extract_top_frames_with_timestamp(
-    video_path: str | Path,
-    top_indices: List[int],
-    top_weights: List[float],
-    total_frames: int = 32,
-    video_duration_sec: float = 0.0,
-    img_size: int | None = None,
-) -> List[dict]:
-    """
-    Sama seperti extract_top_frames, tapi menambahkan field 'timestamp_sec'.
-    Berguna biar user tahu frame itu di menit ke-berapa.
-    """
-    results = extract_top_frames(
-        video_path=video_path,
-        top_indices=top_indices,
-        top_weights=top_weights,
-        total_frames=total_frames,
-        img_size=img_size,
-    )
-
-    if video_duration_sec > 0 and results:
-        timestamps = indices_to_timestamps(
-            indices=[r["frame_index"] for r in results],
-            total_frames=total_frames,
-            video_duration_sec=video_duration_sec,
-        )
-        for i, r in enumerate(results):
-            r["timestamp_sec"] = timestamps[i]
-
-    return results
+    real_frame_idx = int(sampled_indices[idx])
+    return round(real_frame_idx / fps, 2)

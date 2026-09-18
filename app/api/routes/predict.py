@@ -19,7 +19,7 @@ from fastapi import APIRouter, File, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
 from app.config import settings
-from app.core.exceptions import AppException, VideoUnreadableError
+from app.core.exceptions import AppException, InferenceError
 from app.core.logger import get_logger
 from app.schemas.prediction import (
     PREDICTION_RESPONSE_EXAMPLE,
@@ -28,7 +28,7 @@ from app.schemas.prediction import (
     TopFrame,
     VideoMetadata,
 )
-from app.services.frame_extractor import extract_top_frames_with_timestamp
+from app.services.frame_extractor import extract_top_frames
 from app.services.inference import run_inference
 from app.services.video_loader import load_video
 from app.utils.file_utils import (
@@ -48,13 +48,13 @@ router = APIRouter(
 
 
 # ============================================
-# MODEL VERSION (untuk metadata)
+# MODEL VERSION
 # ============================================
 def _get_model_version() -> str:
     """Return string versi model untuk metadata."""
     if settings.is_dummy_mode:
         return "dummy-random-v1"
-    return "efficientnetv2b0-bilstm-attention-v1"
+    return "e3-efficientnetv2b0-bilstm-attention-v1"
 
 
 # ============================================
@@ -120,10 +120,14 @@ async def predict_video(
         logger.debug(f"File disimpan sementara: {temp_path}")
 
         # ---------- [3] LOAD VIDEO ----------
-        frames, video_meta = await run_in_threadpool(
+        # ⚠️ Sekarang return 3 nilai: frames, metadata, sampled_indices
+        frames, video_meta, sampled_indices = await run_in_threadpool(
             load_video, temp_path
         )
-        logger.debug(f"Frame ter-load: shape={frames.shape}")
+        logger.debug(
+            f"Frame ter-load: shape={frames.shape}, "
+            f"sampled_indices={len(sampled_indices)}"
+        )
 
         # ---------- [4] INFERENCE ----------
         result = await run_in_threadpool(run_inference, frames)
@@ -133,13 +137,15 @@ async def predict_video(
         )
 
         # ---------- [5] EKSTRAK TOP-K FRAME ----------
+        # ⚠️ Sekarang pakai sampled_indices & fps (bukan video_duration_sec)
         top_frames_raw = await run_in_threadpool(
-            extract_top_frames_with_timestamp,
+            extract_top_frames,
             temp_path,
             result.top_indices,
             result.top_weights,
+            sampled_indices,
+            video_meta.fps,
             result.total_frames,
-            video_meta.duration_sec,
         )
         logger.debug(f"Top frames diekstrak: {len(top_frames_raw)}")
 
@@ -191,8 +197,6 @@ async def predict_video(
 
     except Exception as e:
         logger.exception(f"Unexpected error saat prediksi: {e}")
-        # Bungkus jadi error generic 500
-        from app.core.exceptions import InferenceError
         raise InferenceError(
             message=f"Terjadi kesalahan saat memproses video: {e}",
         ) from e
@@ -200,10 +204,3 @@ async def predict_video(
     finally:
         # ---------- [7] CLEANUP ----------
         cleanup_file(temp_path)
-
-
-# ============================================
-# POST /predict/batch (opsional, untuk nanti)
-# ============================================
-# Kalau nanti mau support batch upload, tinggal tambah endpoint baru
-# di sini tanpa mengubah yang sudah ada.

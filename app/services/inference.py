@@ -1,14 +1,10 @@
 """
 Service untuk menjalankan inference.
 
-Alur:
-1. Terima frames (32, 160, 160, 3)
-2. Preprocess (tambah batch dim)
-3. Jalankan model.predict() -> confidence, attention_weights
-4. Post-processing:
-   - Tentukan label (Shoplifting/Normal) dari confidence
-   - Sort attention weights -> ambil top-K index
-5. Return dataclass hasil inference
+PENTING (untuk model E3):
+- Frame dari video_loader sudah float32 (0-255), TIDAK perlu preprocess lagi
+- Model EfficientNetV2B0 pakai include_preprocessing=True
+- Jadi _preprocess() hanya: tambah batch dim + pastikan float32
 """
 
 from dataclasses import dataclass, field
@@ -31,12 +27,14 @@ logger = get_logger(__name__)
 @dataclass
 class InferenceResult:
     """Hasil inference siap dipakai route."""
-    prediction: str                    # "Shoplifting" / "Normal"
-    confidence: float                  # 0.0 - 1.0
-    attention_weights: np.ndarray      # shape (32,), sum = 1.0
-    total_frames: int                  # 32
-    top_indices: List[int] = field(default_factory=list)  # [12, 27, 11]
-    top_weights: List[float] = field(default_factory=list)  # [0.15, 0.12, 0.10]
+    prediction: str                       # "Shoplifting" / "Normal"
+    confidence: float                     # 0.0 - 1.0
+    shoplifting_probability: float        # probabilitas Shoplifting
+    normal_probability: float             # probabilitas Normal
+    attention_weights: np.ndarray         # shape (32,), sum = 1.0
+    total_frames: int                     # 32
+    top_indices: List[int] = field(default_factory=list)
+    top_weights: List[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert ke dict (tanpa numpy) untuk response JSON."""
@@ -44,26 +42,32 @@ class InferenceResult:
             "prediction": self.prediction,
             "confidence": round(self.confidence, 4),
             "total_frames": self.total_frames,
-            "attention_weights": [round(float(w), 6) for w in self.attention_weights],
+            "attention_weights": [
+                round(float(w), 6) for w in self.attention_weights
+            ],
         }
 
 
 # ============================================
-# PREPROCESS
+# PREPROCESS (minimal)
 # ============================================
 def _preprocess(frames: np.ndarray) -> np.ndarray:
     """
-    Preprocess frames untuk masuk ke model.
+    Preprocess minimal: tambah batch dim + pastikan float32.
+
+    TIDAK ada preprocess_input di sini, karena model sudah
+    include_preprocessing=True.
 
     Args:
-        frames: (32, 160, 160, 3) uint8 RGB
+        frames: (32, 160, 160, 3) float32 (0-255)
 
     Returns:
         (1, 32, 160, 160, 3) float32
     """
     if frames.ndim != 4:
         raise InferenceError(
-            message=f"Shape frames salah: {frames.shape}. Expected (32, 160, 160, 3)",
+            message=f"Shape frames salah: {frames.shape}. "
+                    f"Expected (32, 160, 160, 3)",
         )
 
     expected_frames = settings.FRAMES
@@ -71,7 +75,8 @@ def _preprocess(frames: np.ndarray) -> np.ndarray:
 
     if frames.shape[0] != expected_frames:
         raise InferenceError(
-            message=f"Jumlah frame salah: {frames.shape[0]}, expected {expected_frames}",
+            message=f"Jumlah frame salah: {frames.shape[0]}, "
+                    f"expected {expected_frames}",
         )
 
     if frames.shape[1] != expected_size or frames.shape[2] != expected_size:
@@ -80,8 +85,13 @@ def _preprocess(frames: np.ndarray) -> np.ndarray:
                     f"expected {expected_size}x{expected_size}",
         )
 
+    # Pastikan float32
+    if frames.dtype != np.float32:
+        logger.debug(f"Convert frames dari {frames.dtype} ke float32")
+        frames = frames.astype(np.float32)
+
     # Tambah batch dimension
-    batch = np.expand_dims(frames, axis=0).astype(np.float32)
+    batch = np.expand_dims(frames, axis=0)
 
     return batch
 
@@ -130,7 +140,7 @@ def run_inference(frames: np.ndarray) -> InferenceResult:
     Jalankan inference lengkap.
 
     Args:
-        frames: numpy array (32, 160, 160, 3) uint8 RGB
+        frames: numpy array (32, 160, 160, 3) float32 (0-255)
 
     Returns:
         InferenceResult
@@ -140,11 +150,11 @@ def run_inference(frames: np.ndarray) -> InferenceResult:
     """
     model = get_model()
 
-    # 1. Preprocess
+    # ---------- 1. PREPROCESS ----------
     batch = _preprocess(frames)
-    logger.debug(f"Input batch shape: {batch.shape}")
+    logger.debug(f"Input batch shape: {batch.shape}, dtype: {batch.dtype}")
 
-    # 2. Predict
+    # ---------- 2. PREDICT ----------
     try:
         confidence, attention = model.predict(batch)
     except Exception as e:
@@ -153,39 +163,54 @@ def run_inference(frames: np.ndarray) -> InferenceResult:
             message=f"Gagal menjalankan model: {e}",
         ) from e
 
-    # 3. Validasi output
+    # ---------- 3. VALIDASI OUTPUT ----------
     confidence = float(confidence)
     attention = np.asarray(attention, dtype=np.float32).flatten()
 
+    # Clip confidence ke [0, 1]
     if not 0.0 <= confidence <= 1.0:
-        logger.warning(f"Confidence di luar range [0,1]: {confidence}. Clip.")
+        logger.warning(
+            f"Confidence di luar range [0,1]: {confidence}. Clip."
+        )
         confidence = float(np.clip(confidence, 0.0, 1.0))
 
+    # Cek panjang attention
     if len(attention) != settings.FRAMES:
         raise InferenceError(
-            message=f"Panjang attention salah: {len(attention)}, expected {settings.FRAMES}",
+            message=f"Panjang attention salah: {len(attention)}, "
+                    f"expected {settings.FRAMES}",
         )
 
-    # Normalisasi (jaga-jaga)
+    # Normalisasi attention (jaga-jaga, harusnya sudah sum=1 dari model)
     att_sum = attention.sum()
     if att_sum > 0:
         attention = attention / att_sum
 
-    # 4. Tentukan label
+    # ---------- 4. HITUNG PROBABILITAS ----------
+    shoplifting_prob = confidence
+    normal_prob = 1.0 - confidence
+
+    # ---------- 5. TENTUKAN LABEL ----------
     prediction = _determine_label(confidence)
 
-    # 5. Ambil top-K
-    top_indices, top_weights = _get_top_k_indices(attention, settings.TOP_K_FRAMES)
+    # ---------- 6. AMBIL TOP-K ----------
+    top_indices, top_weights = _get_top_k_indices(
+        attention,
+        settings.TOP_K_FRAMES,
+    )
 
     logger.info(
         f"Inference selesai: prediction={prediction}, "
         f"confidence={confidence:.4f}, "
-        f"top-{settings.TOP_K_FRAMES}={list(zip(top_indices, [round(w, 4) for w in top_weights]))}"
+        f"top-{settings.TOP_K_FRAMES}="
+        f"{list(zip(top_indices, [round(w, 4) for w in top_weights]))}"
     )
 
     return InferenceResult(
         prediction=prediction,
         confidence=confidence,
+        shoplifting_probability=shoplifting_prob,
+        normal_probability=normal_prob,
         attention_weights=attention,
         total_frames=settings.FRAMES,
         top_indices=top_indices,

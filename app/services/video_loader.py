@@ -1,13 +1,11 @@
 """
 Service untuk load video & sampling frame.
 
-Alur:
-1. Buka video dengan OpenCV
-2. Baca semua frame (atau sample berdasarkan target)
-3. Sampling uniform ke N frame (default 32)
-4. Resize ke (IMG_SIZE, IMG_SIZE)
-5. Convert BGR -> RGB
-6. Return numpy array shape (32, 160, 160, 3) uint8
+PENTING (untuk model E3):
+- Model EfficientNetV2B0 pakai `include_preprocessing=True`, jadi
+  frame TIDAK perlu di-preprocess lagi di sini.
+- Frame di-return sebagai float32 (0-255), BUKAN uint8.
+- Return juga sampled_indices untuk timestamp akurat.
 """
 
 from pathlib import Path
@@ -55,9 +53,6 @@ class VideoMetadata:
         }
 
 
-# ============================================
-# BACA METADATA
-# ============================================
 def _read_metadata(cap: cv2.VideoCapture) -> VideoMetadata:
     """Baca metadata dari VideoCapture."""
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -65,7 +60,6 @@ def _read_metadata(cap: cv2.VideoCapture) -> VideoMetadata:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # FPS kadang 0 di beberapa codec, fallback ke 30
     if fps <= 0:
         logger.warning("FPS tidak terbaca, fallback ke 30")
         fps = 30.0
@@ -82,13 +76,38 @@ def _read_metadata(cap: cv2.VideoCapture) -> VideoMetadata:
 
 
 # ============================================
-# LOAD VIDEO -> NUMPY ARRAY
+# UNIFORM SAMPLING
+# ============================================
+def _uniform_sample_indices(total: int, target: int) -> np.ndarray:
+    """
+    Hasilkan index frame yang tersebar uniform.
+    Sama persis dengan training (np.linspace).
+
+    Contoh:
+        total=320, target=32 -> [0, 10, 20, ..., 319]
+        total=10, target=32  -> [0, 1, 2, ..., 9, 9, 9, ...]  (pad)
+    """
+    if total <= 0:
+        return np.array([], dtype=int)
+
+    if total >= target:
+        indices = np.linspace(0, total - 1, target, dtype=int)
+        return indices
+    else:
+        indices = list(range(total))
+        while len(indices) < target:
+            indices.append(total - 1)
+        return np.array(indices, dtype=int)
+
+
+# ============================================
+# LOAD VIDEO
 # ============================================
 def load_video(
     video_path: str | Path,
     max_frames: Optional[int] = None,
     img_size: Optional[int] = None,
-) -> tuple[np.ndarray, VideoMetadata]:
+) -> tuple[np.ndarray, VideoMetadata, np.ndarray]:
     """
     Load video & sampling ke N frame.
 
@@ -98,8 +117,10 @@ def load_video(
         img_size: ukuran resize (default dari settings.IMG_SIZE = 160)
 
     Returns:
-        (frames_array, metadata)
-        frames_array: (max_frames, img_size, img_size, 3) uint8 RGB
+        (frames_array, metadata, sampled_indices)
+        - frames_array: (max_frames, img_size, img_size, 3) float32 (0-255)
+        - metadata: VideoMetadata
+        - sampled_indices: index frame asli yang dipilih (untuk timestamp)
 
     Raises:
         VideoUnreadableError: kalau video tidak bisa dibaca
@@ -148,74 +169,50 @@ def load_video(
                 message="Tidak ada frame yang berhasil dibaca dari video",
             )
 
-        logger.debug(f"Total frame dibaca: {len(raw_frames)}")
+        original_frame_count = len(raw_frames)
+        logger.debug(f"Total frame dibaca: {original_frame_count}")
 
         # ---------- SAMPLING UNIFORM ----------
         sampled_indices = _uniform_sample_indices(
-            total=len(raw_frames),
+            total=original_frame_count,
             target=max_frames,
         )
 
         sampled_frames = []
         for idx in sampled_indices:
             frame = raw_frames[idx]
-            # Resize ke (img_size, img_size)
-            frame = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            # Resize
+            frame = cv2.resize(
+                frame,
+                (img_size, img_size),
+                interpolation=cv2.INTER_AREA,
+            )
             # BGR -> RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             sampled_frames.append(frame)
 
-        # ---------- PAD KALAU KURANG ----------
-        # (sudah di-handle di _uniform_sample_indices, tapi jaga-jaga)
+        # Pad kalau kurang (jaga-jaga)
         while len(sampled_frames) < max_frames:
             sampled_frames.append(sampled_frames[-1])
 
-        # Trim kalau kelebihan
         sampled_frames = sampled_frames[:max_frames]
 
-        frames_array = np.array(sampled_frames, dtype=np.uint8)
+        # ⚠️ PENTING: float32 (0-255), BUKAN uint8 & BUKAN preprocess
+        frames_array = np.array(sampled_frames, dtype=np.float32)
 
         logger.info(
             f"Sampling selesai: {len(sampled_frames)} frames, "
-            f"shape={frames_array.shape}"
+            f"shape={frames_array.shape}, dtype={frames_array.dtype}"
         )
 
-        return frames_array, metadata
+        return frames_array, metadata, sampled_indices
 
     finally:
         cap.release()
 
 
 # ============================================
-# UNIFORM SAMPLING
-# ============================================
-def _uniform_sample_indices(total: int, target: int) -> list[int]:
-    """
-    Hasilkan index frame yang tersebar uniform.
-    
-    Contoh: total=100, target=5 -> [0, 25, 50, 74, 99]
-    Contoh: total=10, target=5  -> [0, 2, 4, 6, 9]
-    Contoh: total=3, target=5   -> [0, 0, 1, 2, 2]  (di-pad)
-    """
-    if total <= 0:
-        return []
-
-    if total >= target:
-        # linspace: 0 sampai total-1, sebanyak target
-        indices = np.linspace(0, total - 1, target, dtype=int)
-        return indices.tolist()
-    else:
-        # Video lebih pendek dari target -> pad
-        # Ambil semua frame, lalu ulang dari awal / akhir
-        indices = list(range(total))
-        # Ulang frame terakhir biar cukup
-        while len(indices) < target:
-            indices.append(total - 1)
-        return indices
-
-
-# ============================================
-# AMBIL 1 FRAME SPESIFIK (untuk top-K)
+# AMBIL FRAME SPESIFIK (untuk top-K)
 # ============================================
 def get_frames_at_indices(
     video_path: str | Path,
@@ -224,9 +221,8 @@ def get_frames_at_indices(
     img_size: Optional[int] = None,
 ) -> list[np.ndarray]:
     """
-    Ambil frame tertentu dari video (sesuai index di 32 frame sampling).
-
-    Berguna untuk ambil top-3 frame setelah tahu index-nya dari attention weights.
+    Ambil frame tertentu dari video (sesuai index di 32 sampling).
+    Return list of numpy array (H, W, 3) uint8 RGB — untuk display.
 
     Args:
         video_path: path video
@@ -235,7 +231,7 @@ def get_frames_at_indices(
         img_size: ukuran resize
 
     Returns:
-        list numpy array (H, W, 3) RGB
+        list numpy array (H, W, 3) uint8 RGB
     """
     video_path = Path(video_path)
     img_size = img_size or settings.IMG_SIZE
@@ -246,9 +242,10 @@ def get_frames_at_indices(
 
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # Hitung index asli di video (bukan index sampling)
-        sample_indices = _uniform_sample_indices(total=total, target=target_frames)
+        sample_indices = _uniform_sample_indices(
+            total=total,
+            target=target_frames,
+        )
 
         results = []
         for idx in indices:
@@ -256,7 +253,7 @@ def get_frames_at_indices(
                 logger.warning(f"Index {idx} di luar range, skip")
                 continue
 
-            real_idx = sample_indices[idx]
+            real_idx = int(sample_indices[idx])
             cap.set(cv2.CAP_PROP_POS_FRAMES, real_idx)
             ret, frame = cap.read()
 
@@ -264,9 +261,15 @@ def get_frames_at_indices(
                 logger.warning(f"Gagal baca frame ke-{real_idx}")
                 continue
 
-            frame = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            frame = cv2.resize(
+                frame,
+                (img_size, img_size),
+                interpolation=cv2.INTER_AREA,
+            )
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results.append(frame)
+
+            # Untuk display: uint8 (biar base64 PNG benar)
+            results.append(frame.astype(np.uint8))
 
         return results
 
@@ -275,12 +278,30 @@ def get_frames_at_indices(
 
 
 # ============================================
+# HELPER: HITUNG TIMESTAMP
+# ============================================
+def indices_to_timestamps(
+    sampled_indices: np.ndarray,
+    fps: float,
+) -> np.ndarray:
+    """
+    Konversi index frame asli -> timestamp (detik).
+
+    Contoh:
+        sampled_indices = [0, 10, 20, 30, ..., 319]
+        fps = 30
+        -> timestamps = [0.0, 0.33, 0.67, 1.0, ..., 10.63]
+    """
+    if fps <= 0:
+        return np.zeros(len(sampled_indices))
+    return sampled_indices / fps
+
+
+# ============================================
 # QUICK CHECK: VIDEO BISA DIBACA?
 # ============================================
 def is_video_readable(video_path: str | Path) -> bool:
-    """
-    Cek cepat apakah video bisa dibuka tanpa load semua frame.
-    """
+    """Cek cepat apakah video bisa dibuka tanpa load semua frame."""
     try:
         cap = cv2.VideoCapture(str(video_path))
         readable = cap.isOpened()

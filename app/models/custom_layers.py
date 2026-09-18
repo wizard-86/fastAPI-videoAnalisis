@@ -1,7 +1,9 @@
 """
-Definisi custom layer Keras yang dipakai di model:
-1. SEBlock       -> Squeeze-and-Excitation (channel attention)
-2. TemporalAttention -> attention per frame (temporal)
+Custom layer Keras — SAMA PERSIS dengan training.
+
+Layer:
+1. SEBlock          -> Squeeze-and-Excitation (pakai Conv2D 1x1)
+2. TemporalAttention -> Attention per frame + return tuple
 
 File ini di-import secara LAZY (hanya saat load model asli).
 Kalau masih dummy mode, file ini tidak di-import.
@@ -17,13 +19,9 @@ logger = get_logger(__name__)
 # LAZY IMPORT GUARD
 # ============================================
 def _ensure_keras_available():
-    """
-    Pastikan TensorFlow/Keras sudah terinstall.
-    Kalau belum, raise error yang jelas.
-    """
+    """Pastikan TensorFlow/Keras sudah terinstall."""
     try:
         import tensorflow as tf  # noqa: F401
-        from tensorflow.keras import layers, backend as K  # noqa: F401
     except ImportError as e:
         raise ImportError(
             "TensorFlow belum terinstall. "
@@ -33,60 +31,67 @@ def _ensure_keras_available():
 
 
 # ============================================
-# CUSTOM LAYERS
+# SEBLOCK — VERSI TRAINING
 # ============================================
-def get_custom_layers() -> dict:
+def _make_seblock():
     """
-    Return dict {nama_layer: class} untuk dipakai
-    di `tf.keras.models.load_model(..., custom_objects=...)`.
-
-    Contoh pemakaian:
-        from app.models.custom_layers import get_custom_layers
-        model = tf.keras.models.load_model(
-            "best_model.keras",
-            custom_objects=get_custom_layers()
-        )
+    Factory function untuk SEBlock (butuh closure TF).
+    Dipanggil setiap kali butuh class baru.
     """
-    _ensure_keras_available()
-
     import tensorflow as tf
-    from tensorflow.keras import layers, backend as K
+    from tensorflow.keras import layers
 
-    # ============================================
-    # SEBlock (Squeeze-and-Excitation)
-    # ============================================
     class SEBlock(layers.Layer):
         """
-        Squeeze-and-Excitation block.
-        - Squeeze: Global Average Pooling -> (batch, channels)
-        - Excitation: Dense -> Dense (sigmoid) -> (batch, channels)
-        - Scale: Multiply input dengan attention weights
+        Squeeze-and-Excitation Block (versi training).
+        Pakai Conv2D 1x1, BUKAN Dense.
         """
 
-        def __init__(self, reduction: int = 16, **kwargs):
+        def __init__(self, reduction=16, **kwargs):
             super().__init__(**kwargs)
             self.reduction = reduction
 
+            self.gap = layers.GlobalAveragePooling2D(
+                keepdims=True,
+                name="se_gap",
+            )
+
+            self.dense1 = None
+            self.dense2 = None
+
         def build(self, input_shape):
             channels = int(input_shape[-1])
-            self.dense1 = layers.Dense(
-                max(1, channels // self.reduction),
+            reduced_channels = max(channels // self.reduction, 1)
+
+            # Reduce channel
+            self.dense1 = layers.Conv2D(
+                reduced_channels,
+                kernel_size=1,
                 activation="relu",
-                name=f"{self.name}_dense1",
+                padding="same",
+                name="se_reduce",
             )
-            self.dense2 = layers.Dense(
+
+            # Expand channel
+            self.dense2 = layers.Conv2D(
                 channels,
+                kernel_size=1,
                 activation="sigmoid",
-                name=f"{self.name}_dense2",
+                padding="same",
+                name="se_expand",
             )
+
+            # Explicit build child layers
+            self.dense1.build((None, 1, 1, channels))
+            self.dense2.build((None, 1, 1, reduced_channels))
+
             super().build(input_shape)
 
         def call(self, inputs):
-            x = layers.GlobalAveragePooling2D()(inputs)
-            x = self.dense1(x)
-            x = self.dense2(x)
-            x = layers.Reshape((1, 1, int(inputs.shape[-1])))(x)
-            return layers.Multiply()([inputs, x])
+            scale = self.gap(inputs)
+            scale = self.dense1(scale)
+            scale = self.dense2(scale)
+            return inputs * scale
 
         def compute_output_shape(self, input_shape):
             return input_shape
@@ -96,38 +101,104 @@ def get_custom_layers() -> dict:
             config.update({"reduction": self.reduction})
             return config
 
-    # ============================================
-    # TemporalAttention
-    # ============================================
+    return SEBlock
+
+
+# ============================================
+# TEMPORAL ATTENTION — VERSI TRAINING
+# ============================================
+def _make_temporal_attention():
+    """
+    Factory function untuk TemporalAttention (butuh closure TF).
+    Return tuple: (context, attention_weights).
+    """
+    import tensorflow as tf
+    from tensorflow.keras import layers
+
     class TemporalAttention(layers.Layer):
         """
-        Attention per frame (temporal dimension).
-        Input : (batch, T, features)
-        Output: context_vector (batch, features), attention_weights (batch, T)
+        Temporal Attention (versi training).
+        Pakai W (feature_dim, 1) + bias b.
+        Return tuple (context, attention_weights).
         """
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
 
         def build(self, input_shape):
+            feature_dim = int(input_shape[-1])
+
             self.W = self.add_weight(
-                name="att_weight",
-                shape=(input_shape[-1],),
-                initializer="random_normal",
+                name="attention_weight",
+                shape=(feature_dim, 1),
+                initializer="glorot_uniform",
                 trainable=True,
             )
+
+            self.b = self.add_weight(
+                name="attention_bias",
+                shape=(1,),
+                initializer="zeros",
+                trainable=True,
+            )
+
             super().build(input_shape)
 
         def call(self, inputs):
-            # inputs: (batch, T, features)
-            scores = K.tanh(K.sum(inputs * self.W, axis=-1))  # (batch, T)
-            alpha = K.softmax(scores)                          # (batch, T)
-            alpha_exp = K.expand_dims(alpha, axis=-1)          # (batch, T, 1)
-            context = K.sum(inputs * alpha_exp, axis=1)        # (batch, features)
-            return context, alpha
+            # Score tiap frame
+            score = tf.tanh(
+                tf.matmul(inputs, self.W) + self.b
+            )
+
+            # Softmax antar frame
+            attention_weights = tf.nn.softmax(score, axis=1)
+
+            # Weighted sum
+            context = tf.reduce_sum(
+                inputs * attention_weights,
+                axis=1,
+            )
+
+            return (
+                context,
+                tf.squeeze(attention_weights, axis=-1),
+            )
 
         def compute_output_shape(self, input_shape):
-            return [(input_shape[0], input_shape[-1]), (input_shape[0], input_shape[1])]
+            batch_size = input_shape[0]
+            time_steps = input_shape[1]
+            feature_dim = input_shape[2]
+
+            return (
+                (batch_size, feature_dim),
+                (batch_size, time_steps),
+            )
+
+        def get_config(self):
+            return super().get_config()
+
+    return TemporalAttention
+
+
+# ============================================
+# EXPORT: UNTUK load_model(custom_objects=...)
+# ============================================
+def get_custom_layers() -> dict:
+    """
+    Return dict {nama_layer: class} untuk dipakai di
+    `tf.keras.models.load_model(..., custom_objects=...)`.
+
+    Contoh:
+        from app.models.custom_layers import get_custom_layers
+        model = tf.keras.models.load_model(
+            "best_model.keras",
+            custom_objects=get_custom_layers()
+        )
+    """
+    _ensure_keras_available()
+
+    SEBlock = _make_seblock()
+    TemporalAttention = _make_temporal_attention()
 
     logger.info("✅ Custom layers (SEBlock, TemporalAttention) siap dipakai")
 
@@ -138,19 +209,19 @@ def get_custom_layers() -> dict:
 
 
 # ============================================
-# CATATAN UNTUK NANTI
+# EXPORT: UNTUK build_e3_model()
 # ============================================
-# Saat model asli sudah siap:
-#
-# 1. Uncomment tensorflow & keras di requirements.txt
-# 2. pip install -r requirements.txt
-# 3. Set USE_DUMMY_MODEL=False di .env
-# 4. Taruh file best_model.keras di app/ml_models/
-# 5. model_loader.py akan otomatis load dengan custom_objects
-#
-# Kalau ada error seperti:
-#   "Unknown layer: SEBlock"
-#   "Unknown layer: TemporalAttention"
-#
-# Berarti custom_objects belum terpasang dengan benar.
-# Cek: pastikan get_custom_layers() dipanggil saat load_model().
+def get_seblock_class():
+    """
+    Return class SEBlock untuk dipakai di build_e3_model().
+    """
+    _ensure_keras_available()
+    return _make_seblock()
+
+
+def get_temporal_attention_class():
+    """
+    Return class TemporalAttention untuk dipakai di build_e3_model().
+    """
+    _ensure_keras_available()
+    return _make_temporal_attention()
